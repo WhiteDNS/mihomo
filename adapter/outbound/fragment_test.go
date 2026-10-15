@@ -25,7 +25,7 @@ func TestFragmentOptionDecode(t *testing.T) {
 		"uuid":          "00000000-0000-0000-0000-000000000000",
 		"cipher-suites": "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
 		"fragments": []any{
-			map[string]any{"packets": "tlshello", "lengths": []any{0, 104, 1}, "delays": []any{0}, "maxSplit": 0},
+			map[string]any{"packets": "tlshello", "lengths": []any{0, 104, 1}, "delays": []any{0}, "maxSplit": 4},
 			map[string]any{"packets": "1-1", "lengths": []any{114, 1}, "delays": []any{1}, "maxSplit": 11},
 		},
 	}, &option))
@@ -38,7 +38,7 @@ func TestFragmentOptionDecode(t *testing.T) {
 	require.True(t, config.tlsHello)
 	require.Equal(t, []FragmentRange{{Min: 0, Max: 0}, {Min: 104, Max: 104}, {Min: 1, Max: 1}}, config.lengths)
 	require.Equal(t, []FragmentRange{{Min: 0, Max: 0}}, config.delays)
-	require.Equal(t, FragmentRange{}, config.maxSplit)
+	require.Equal(t, FragmentRange{Min: 4, Max: 4}, config.maxSplit)
 
 	config, err = option.Fragments[1].build()
 	require.NoError(t, err)
@@ -58,6 +58,10 @@ func TestFragmentOptionValidation(t *testing.T) {
 		{name: "delay aliases", option: FragmentOption{Length: &FragmentRange{Min: 1, Max: 1}, Delay: &FragmentRange{}, Interval: &FragmentRange{}}},
 		{name: "max split aliases", option: FragmentOption{Length: &FragmentRange{Min: 1, Max: 1}, MaxSplit: &FragmentRange{}, MaxSplitCompat: &FragmentRange{}}},
 		{name: "excessive delay", option: FragmentOption{Length: &FragmentRange{Min: 1, Max: 1}, Delay: &FragmentRange{Min: 1_001, Max: 1_001}}},
+		{name: "too many lengths", option: FragmentOption{Lengths: make([]FragmentRange, maxFragmentRanges+1)}},
+		{name: "too many delays", option: FragmentOption{Length: &FragmentRange{Min: 1, Max: 1}, Delays: make([]FragmentRange, maxFragmentRanges+1)}},
+		{name: "zero max split", option: FragmentOption{Length: &FragmentRange{Min: 1, Max: 1}, MaxSplit: &FragmentRange{}}},
+		{name: "excessive max split", option: FragmentOption{Length: &FragmentRange{Min: 1, Max: 1}, MaxSplit: &FragmentRange{Min: 1, Max: maxFragmentSplits + 1}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -65,6 +69,20 @@ func TestFragmentOptionValidation(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestFragmentDefaultSplitLimit(t *testing.T) {
+	raw := &recordingConn{}
+	conn := newFragmentConn(raw, mustFragmentConfig(t, FragmentOption{
+		Length: &FragmentRange{Min: 1, Max: 1},
+	}))
+	input := bytes.Repeat([]byte{'a'}, maxFragmentSplits+100)
+
+	n, err := conn.Write(input)
+	require.NoError(t, err)
+	require.Equal(t, len(input), n)
+	require.Len(t, raw.writes, maxFragmentSplits)
+	require.Equal(t, input, bytes.Join(raw.writes, nil))
 }
 
 func TestFragmentStageLimit(t *testing.T) {

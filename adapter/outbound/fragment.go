@@ -19,6 +19,8 @@ import (
 
 const (
 	maxFragmentStages     = 8
+	maxFragmentRanges     = 256
+	maxFragmentSplits     = 256
 	maxFragmentDelay      = time.Second
 	maxFragmentWriteDelay = 10 * time.Second
 )
@@ -100,6 +102,9 @@ func (o *FragmentOption) build() (*fragmentConfig, error) {
 		c.from, c.to = uint64(packetRange.Min), uint64(packetRange.Max)
 	}
 
+	if len(o.Lengths) > maxFragmentRanges {
+		return nil, fmt.Errorf("lengths must contain at most %d ranges", maxFragmentRanges)
+	}
 	if len(o.Lengths) > 0 {
 		c.lengths = append([]FragmentRange(nil), o.Lengths...)
 	} else if o.Length != nil {
@@ -111,6 +116,9 @@ func (o *FragmentOption) build() (*fragmentConfig, error) {
 		return nil, fmt.Errorf("last length range must start above zero")
 	}
 
+	if len(o.Delays) > maxFragmentRanges {
+		return nil, fmt.Errorf("delays must contain at most %d ranges", maxFragmentRanges)
+	}
 	if len(o.Delays) > 0 {
 		c.delays = append([]FragmentRange(nil), o.Delays...)
 	} else {
@@ -140,6 +148,11 @@ func (o *FragmentOption) build() (*fragmentConfig, error) {
 		c.maxSplit = *o.MaxSplit
 	case o.MaxSplitCompat != nil:
 		c.maxSplit = *o.MaxSplitCompat
+	default:
+		c.maxSplit = FragmentRange{Min: maxFragmentSplits, Max: maxFragmentSplits}
+	}
+	if c.maxSplit.Min < 1 || c.maxSplit.Max > maxFragmentSplits {
+		return nil, fmt.Errorf("max-split must be between 1 and %d", maxFragmentSplits)
 	}
 	return c, nil
 }
