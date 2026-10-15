@@ -191,12 +191,14 @@ func (b *Base) Close() error {
 }
 
 type BasicOption struct {
-	TFO         bool        `proxy:"tfo,omitempty"`
-	MPTCP       bool        `proxy:"mptcp,omitempty"`
-	Interface   string      `proxy:"interface-name,omitempty"`
-	RoutingMark int         `proxy:"routing-mark,omitempty"`
-	IPVersion   C.DNSPrefer `proxy:"ip-version,omitempty"`
-	DialerProxy string      `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
+	TFO         bool             `proxy:"tfo,omitempty"`
+	MPTCP       bool             `proxy:"mptcp,omitempty"`
+	Interface   string           `proxy:"interface-name,omitempty"`
+	RoutingMark int              `proxy:"routing-mark,omitempty"`
+	IPVersion   C.DNSPrefer      `proxy:"ip-version,omitempty"`
+	DialerProxy string           `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
+	Fragment    *FragmentOption  `proxy:"fragment,omitempty"`
+	Fragments   []FragmentOption `proxy:"fragments,omitempty"`
 
 	//
 	// The following parameters are used internally, assign value by the structure decoder are disallowed
@@ -215,7 +217,27 @@ func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
 			cDialer = dialer.NewDialer(opts...)
 		}
 	}
-	return cDialer
+	return newFragmentDialerChain(cDialer, b.Fragment, b.Fragments)
+}
+
+func (b *BasicOption) Validate() error {
+	if b.Fragment != nil && len(b.Fragments) != 0 {
+		return fmt.Errorf("fragment and fragments cannot both be set")
+	}
+	if len(b.Fragments) > maxFragmentStages {
+		return fmt.Errorf("fragments must contain at most %d stages", maxFragmentStages)
+	}
+	if b.Fragment != nil {
+		if _, err := b.Fragment.build(); err != nil {
+			return err
+		}
+	}
+	for i := range b.Fragments {
+		if _, err := b.Fragments[i].build(); err != nil {
+			return fmt.Errorf("fragments[%d]: %w", i, err)
+		}
+	}
+	return nil
 }
 
 func (b *BasicOption) NewTunnel() C.Tunnel {

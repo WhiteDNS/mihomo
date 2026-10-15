@@ -28,6 +28,7 @@ import (
 	"github.com/metacubex/mihomo/component/sniffer"
 	"github.com/metacubex/mihomo/component/trie"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	P "github.com/metacubex/mihomo/constant/provider"
 	snifferTypes "github.com/metacubex/mihomo/constant/sniffer"
 	"github.com/metacubex/mihomo/dns"
@@ -609,7 +610,11 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 		return nil, fmt.Errorf("decrypt config error: %w", err)
 	}
 
-	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
+	if features.Android {
+		if err := unmarshalWhiteVPNConfig(buf, rawCfg); err != nil {
+			return nil, err
+		}
+	} else if err := yaml.Unmarshal(buf, rawCfg); err != nil {
 		return nil, err
 	}
 
@@ -989,6 +994,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		return nil, nil, err
 	}
 
+	SetProxyNameList(proxyList)
 	return proxies, providersMap, nil
 }
 

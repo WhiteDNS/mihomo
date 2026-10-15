@@ -2,10 +2,13 @@ package outbound
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"os"
@@ -26,14 +29,17 @@ import (
 
 	amneziav3 "github.com/metacubex/amneziawg-go/device"
 	amnezia "github.com/metacubex/amneziawg-go/device_v1"
+	amneziaawg "github.com/metacubex/amneziawg-go/device_v1/awg"
 	"github.com/metacubex/mipstack"
 	wireguard "github.com/metacubex/sing-wireguard"
+	wgconn "github.com/metacubex/wireguard-go/conn"
 	"github.com/metacubex/wireguard-go/device"
 	"github.com/metacubex/wireguard-go/tun"
 
 	"github.com/metacubex/sing/common/debug"
 	E "github.com/metacubex/sing/common/exceptions"
 	M "github.com/metacubex/sing/common/metadata"
+	N "github.com/metacubex/sing/common/network"
 )
 
 const (
@@ -45,6 +51,263 @@ const (
 type wireguardGoDevice interface {
 	Close()
 	IpcSet(uapiConf string) error
+}
+
+const (
+	wireGuardHandshakeInitiationSize = 148
+	maxWireGuardDPIFakeCount         = 20
+	maxWireGuardDPIFakeSize          = 1280
+	maxWireGuardDPIFakeTTL           = 255
+	wireGuardDefaultDPIFakeTTL       = 3
+)
+
+type wireGuardDPIStrategy uint32
+
+const (
+	wireGuardDPIStrategyBurst wireGuardDPIStrategy = iota
+	wireGuardDPIStrategyPairedDuplicates
+	wireGuardDPIStrategyInterleavedDuplicates
+	wireGuardDPIStrategyTTL
+	wireGuardDPIStrategyCount
+)
+
+type wireGuardDPIBind struct {
+	wgconn.Bind
+	option    WireGuardDPIOption
+	pattern   wireGuardInitiationPattern
+	control   *wireGuardDPIWriteControl
+	identity  string
+	rotations map[string]uint32
+	mutex     sync.Mutex
+}
+
+type WireGuardDPIOption struct {
+	FakeCount   int `proxy:"fake-count,omitempty"`
+	FakeMinSize int `proxy:"fake-min-size,omitempty"`
+	FakeMaxSize int `proxy:"fake-max-size,omitempty"`
+	FakeTTL     int `proxy:"fake-ttl,omitempty"`
+}
+
+type wireGuardInitiationPattern struct {
+	size       int
+	typeOffset int
+	typeMin    uint32
+	typeMax    uint32
+}
+
+type wireGuardDPIWriteControl struct {
+	ttl int
+}
+
+type wireGuardDPIDialer struct {
+	N.Dialer
+	control *wireGuardDPIWriteControl
+}
+
+type wireGuardDPIUDPConn struct {
+	*net.UDPConn
+	control *wireGuardDPIWriteControl
+}
+
+var (
+	_ wgconn.Bind    = (*wireGuardDPIBind)(nil)
+	_ N.Dialer       = (*wireGuardDPIDialer)(nil)
+	_ net.Conn       = (*wireGuardDPIUDPConn)(nil)
+	_ net.PacketConn = (*wireGuardDPIUDPConn)(nil)
+)
+
+func (o WireGuardDPIOption) enabled() bool {
+	return o.FakeCount != 0 || o.FakeMinSize != 0 || o.FakeMaxSize != 0 || o.FakeTTL != 0
+}
+
+func (o WireGuardDPIOption) validate() error {
+	if o.FakeCount < 1 || o.FakeCount > maxWireGuardDPIFakeCount {
+		return E.New("wireguard dpi fake-count must be between 1 and ", maxWireGuardDPIFakeCount)
+	}
+	if o.FakeMinSize < 1 || o.FakeMaxSize > maxWireGuardDPIFakeSize || o.FakeMinSize > o.FakeMaxSize {
+		return E.New("wireguard dpi sizes must satisfy 1 <= fake-min-size <= fake-max-size <= ", maxWireGuardDPIFakeSize)
+	}
+	if o.FakeTTL < 0 || o.FakeTTL > maxWireGuardDPIFakeTTL {
+		return E.New("wireguard dpi fake-ttl must be between 0 and ", maxWireGuardDPIFakeTTL)
+	}
+	return nil
+}
+
+func (p wireGuardInitiationPattern) matches(packet []byte) bool {
+	if len(packet) != p.size || p.typeOffset < 0 || p.typeOffset+4 > len(packet) {
+		return false
+	}
+	messageType := binary.LittleEndian.Uint32(packet[p.typeOffset : p.typeOffset+4])
+	return messageType >= p.typeMin && messageType <= p.typeMax
+}
+
+func newWireGuardInitiationPattern(option *AmneziaWGOption) (wireGuardInitiationPattern, error) {
+	pattern := wireGuardInitiationPattern{
+		size:    wireGuardHandshakeInitiationSize,
+		typeMin: 1,
+		typeMax: 1,
+	}
+	if option == nil || !option.hasHandshakeChanges() {
+		return pattern, nil
+	}
+	if option.S1 < 0 {
+		return pattern, E.New("wireguard dpi cannot match a negative amnezia s1")
+	}
+	pattern.size += option.S1
+	pattern.typeOffset = option.S1
+	if option.H1 == "" {
+		return pattern, nil
+	}
+	header, err := amneziaawg.ParseMagicHeader("h1", option.H1)
+	if err != nil {
+		return pattern, E.Cause(err, "parse amnezia h1 for wireguard dpi")
+	}
+	if header.Min > 4 {
+		pattern.typeMin = header.Min
+		pattern.typeMax = header.Max
+	}
+	return pattern, nil
+}
+
+func (b *wireGuardDPIBind) Send(bufs [][]byte, endpoint wgconn.Endpoint) error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	if len(bufs) != 1 || !b.pattern.matches(bufs[0]) {
+		return b.send(bufs, endpoint, 0)
+	}
+
+	strategy := b.nextStrategy(endpoint)
+	for _, fake := range b.fakePlan(strategy) {
+		ttl := 0
+		if strategy == wireGuardDPIStrategyTTL {
+			ttl = b.option.FakeTTL
+		}
+		if err := b.send([][]byte{fake}, endpoint, ttl); err != nil {
+			break
+		}
+	}
+	// Every strategy is fail-open and leaves the authenticated packet untouched.
+	return b.send(bufs, endpoint, 0)
+}
+
+func (b *wireGuardDPIBind) nextStrategy(endpoint wgconn.Endpoint) wireGuardDPIStrategy {
+	endpointKey := ""
+	if endpoint != nil {
+		endpointKey = endpoint.DstToString()
+	}
+	attempt := b.rotations[endpointKey]
+	b.rotations[endpointKey] = attempt + 1
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(b.identity + "|" + endpointKey))
+	return wireGuardDPIStrategy((hash.Sum32() + attempt) % uint32(wireGuardDPIStrategyCount))
+}
+
+func (b *wireGuardDPIBind) fakePlan(strategy wireGuardDPIStrategy) [][]byte {
+	if strategy != wireGuardDPIStrategyPairedDuplicates && strategy != wireGuardDPIStrategyInterleavedDuplicates {
+		fakes := make([][]byte, 0, b.option.FakeCount)
+		for len(fakes) < b.option.FakeCount {
+			if fake := b.randomFakePacket(); fake != nil {
+				fakes = append(fakes, fake)
+			} else {
+				break
+			}
+		}
+		return fakes
+	}
+
+	unique := make([][]byte, 0, (b.option.FakeCount+1)/2)
+	for len(unique) < cap(unique) {
+		if fake := b.randomFakePacket(); fake != nil {
+			unique = append(unique, fake)
+		} else {
+			break
+		}
+	}
+	plan := make([][]byte, 0, b.option.FakeCount)
+	if strategy == wireGuardDPIStrategyPairedDuplicates {
+		for _, fake := range unique {
+			plan = append(plan, fake)
+			if len(plan) < b.option.FakeCount {
+				plan = append(plan, fake)
+			}
+		}
+		return plan
+	}
+	plan = append(plan, unique...)
+	for _, fake := range unique {
+		if len(plan) == b.option.FakeCount {
+			break
+		}
+		plan = append(plan, fake)
+	}
+	return plan
+}
+
+func (b *wireGuardDPIBind) randomFakePacket() []byte {
+	size := b.option.FakeMinSize
+	if span := b.option.FakeMaxSize - b.option.FakeMinSize + 1; span > 1 {
+		var sample [2]byte
+		if _, err := rand.Read(sample[:]); err == nil {
+			size += int(binary.LittleEndian.Uint16(sample[:])) % span
+		}
+	}
+	fake := make([]byte, size)
+	if _, err := rand.Read(fake); err != nil {
+		return nil
+	}
+	if b.pattern.typeOffset+4 <= len(fake) {
+		binary.LittleEndian.PutUint32(fake[b.pattern.typeOffset:b.pattern.typeOffset+4], 0)
+	} else {
+		fake[0] = 0
+	}
+	return fake
+}
+
+func (b *wireGuardDPIBind) send(bufs [][]byte, endpoint wgconn.Endpoint, ttl int) error {
+	b.control.ttl = ttl
+	defer func() { b.control.ttl = 0 }()
+	return b.Bind.Send(bufs, endpoint)
+}
+
+func (d *wireGuardDPIDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	connection, err := d.Dialer.DialContext(ctx, network, destination)
+	if err != nil {
+		return nil, err
+	}
+	if udpConn, ok := connection.(*net.UDPConn); ok {
+		return &wireGuardDPIUDPConn{UDPConn: udpConn, control: d.control}, nil
+	}
+	return connection, nil
+}
+
+func (d *wireGuardDPIDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	packetConn, err := d.Dialer.ListenPacket(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	if udpConn, ok := packetConn.(*net.UDPConn); ok {
+		return &wireGuardDPIUDPConn{UDPConn: udpConn, control: d.control}, nil
+	}
+	return packetConn, nil
+}
+
+func (c *wireGuardDPIUDPConn) Write(payload []byte) (int, error) {
+	if c.control.ttl > 0 {
+		if n, err, supported := writeWireGuardUDPWithTTL(c.UDPConn, payload, nil, c.control.ttl); supported && (err == nil || n > 0) {
+			return n, err
+		}
+	}
+	return c.UDPConn.Write(payload)
+}
+
+func (c *wireGuardDPIUDPConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
+	udpDestination, isUDP := destination.(*net.UDPAddr)
+	if c.control.ttl > 0 && isUDP {
+		if n, err, supported := writeWireGuardUDPWithTTL(c.UDPConn, payload, udpDestination, c.control.ttl); supported && (err == nil || n > 0) {
+			return n, err
+		}
+	}
+	return c.UDPConn.WriteTo(payload, destination)
 }
 
 type WireGuard struct {
@@ -80,7 +343,8 @@ type WireGuardOption struct {
 
 	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
 
-	AmneziaWGOption *AmneziaWGOption `proxy:"amnezia-wg-option,omitempty"`
+	AmneziaWGOption *AmneziaWGOption    `proxy:"amnezia-wg-option,omitempty"`
+	DPIOption       *WireGuardDPIOption `proxy:"wireguard-dpi-option,omitempty"`
 
 	Peers []WireGuardPeerOption `proxy:"peers,omitempty"`
 
@@ -288,6 +552,16 @@ func newWireguardDevice(stack ipStack) (wireguardDevice, error) {
 	}, nil
 }
 
+func (o *AmneziaWGOption) hasHandshakeChanges() bool {
+	return o.Version == 3 || o.S1 != 0 || o.S2 != 0 || o.S3 != 0 || o.S4 != 0 ||
+		o.H1 != "" || o.H2 != "" || o.H3 != "" || o.H4 != "" ||
+		o.I1 != "" || o.I2 != "" || o.I3 != "" || o.I4 != "" || o.I5 != "" ||
+		o.J1 != "" || o.J2 != "" || o.J3 != "" || o.Itime != 0 ||
+		o.HeaderProtectionKey != "" || o.ContentPaddingAddition != "" || o.RekeyAfterTime != "" ||
+		o.RekeyTimeout != "" || o.RejectAfterTime != "" || o.KeepaliveTimeout != "" ||
+		o.MaxHandshakeAttempts != "" || o.RandomTrailers || o.DisableCookies
+}
+
 type wgSingErrorHandler struct {
 	name string
 }
@@ -345,6 +619,35 @@ func (option WireGuardOption) Prefixes() ([]netip.Prefix, error) {
 }
 
 func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
+	dpiOption := option.DPIOption
+	// Legacy junk-only options use the standard device so WARP handshakes and reserved bytes stay intact.
+	if awg := option.AmneziaWGOption; awg != nil && !awg.hasHandshakeChanges() {
+		if dpiOption == nil && (awg.JC != 0 || awg.JMin != 0 || awg.JMax != 0) {
+			dpiOption = &WireGuardDPIOption{
+				FakeCount:   awg.JC,
+				FakeMinSize: awg.JMin,
+				FakeMaxSize: awg.JMax,
+				FakeTTL:     wireGuardDefaultDPIFakeTTL,
+			}
+		}
+		option.AmneziaWGOption = nil
+	}
+	if dpiOption != nil {
+		if !dpiOption.enabled() {
+			dpiOption = nil
+		} else if err := dpiOption.validate(); err != nil {
+			return nil, err
+		}
+	}
+	option.DPIOption = dpiOption
+	var initiationPattern wireGuardInitiationPattern
+	var err error
+	if dpiOption != nil {
+		initiationPattern, err = newWireGuardInitiationPattern(option.AmneziaWGOption)
+		if err != nil {
+			return nil, err
+		}
+	}
 	outbound := &WireGuard{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
@@ -359,6 +662,14 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	singDialer := proxydialer.NewSingDialer(proxydialer.NewSlowDownDialer(outbound.dialer, slowdown.New()))
+	var clientDialer N.Dialer = singDialer
+	var dpiControl *wireGuardDPIWriteControl
+	if dpiOption != nil {
+		dpiControl = &wireGuardDPIWriteControl{}
+		if option.DialerProxy == "" && option.DialerForAPI == nil {
+			clientDialer = &wireGuardDPIDialer{Dialer: clientDialer, control: dpiControl}
+		}
+	}
 
 	var reserved [3]uint8
 	if len(option.Reserved) > 0 {
@@ -376,9 +687,8 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 			outbound.connectAddr = option.Addr()
 		}
 	}
-	outbound.bind = wireguard.NewClientBind(context.Background(), wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
+	outbound.bind = wireguard.NewClientBind(context.Background(), wgSingErrorHandler{outbound.Name()}, clientDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
 
-	var err error
 	outbound.localPrefixes, err = option.Prefixes()
 	if err != nil {
 		return nil, err
@@ -474,15 +784,26 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 			log.SingLogger.Error(fmt.Sprintf("[WG](%s) %s", option.Name, fmt.Sprintf(format, args...)))
 		},
 	}
+	deviceBind := wgconn.Bind(outbound.bind)
+	if dpiOption != nil {
+		deviceBind = &wireGuardDPIBind{
+			Bind:      deviceBind,
+			option:    *dpiOption,
+			pattern:   initiationPattern,
+			control:   dpiControl,
+			identity:  option.Name,
+			rotations: make(map[string]uint32),
+		}
+	}
 	if option.AmneziaWGOption != nil {
 		outbound.bind.SetParseReserved(false) // AmneziaWG don't need parse reserved
 		if option.AmneziaWGOption.Version == 3 {
-			outbound.device = amneziav3.NewDevice(outbound.tunDevice, outbound.bind, logger, option.Workers)
+			outbound.device = amneziav3.NewDevice(outbound.tunDevice, deviceBind, logger, option.Workers)
 		} else {
-			outbound.device = amnezia.NewDevice(outbound.tunDevice, outbound.bind, logger, option.Workers)
+			outbound.device = amnezia.NewDevice(outbound.tunDevice, deviceBind, logger, option.Workers)
 		}
 	} else {
-		outbound.device = device.NewDevice(outbound.tunDevice, outbound.bind, logger, option.Workers)
+		outbound.device = device.NewDevice(outbound.tunDevice, deviceBind, logger, option.Workers)
 	}
 
 	var has6 bool

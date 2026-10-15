@@ -40,7 +40,7 @@ func NewListener(inner net.Listener, config *Config) net.Listener {
 }
 
 func GetFingerprint(clientFingerprint string) (UClientHelloID, bool) {
-	if len(clientFingerprint) == 0 || clientFingerprint == "none" {
+	if len(clientFingerprint) == 0 || clientFingerprint == "none" || clientFingerprint == "unsafe" {
 		return UClientHelloID{}, false
 	}
 

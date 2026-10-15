@@ -21,6 +21,12 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		TunnelForAPI: opt.TunnelForAPI,
 		ProviderName: opt.ProviderName,
 	}
+	if err := decoder.Decode(mapping, &basicOption); err != nil {
+		return nil, err
+	}
+	if err := basicOption.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid fragment config: %w", err)
+	}
 
 	var (
 		proxy outbound.ProxyAdapter

@@ -12,7 +12,9 @@ import (
 
 type Direct struct {
 	*Base
-	loopBack *loopback.Detector
+	loopBack        *loopback.Detector
+	fragmentOption  *FragmentOption
+	fragmentOptions []FragmentOption
 }
 
 type DirectOption struct {
@@ -27,7 +29,7 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
 	}
 	opts := d.DialOptions()
 	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
-	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
+	c, err := newFragmentDialerChain(dialer.NewDialer(opts...), d.fragmentOption, d.fragmentOptions).DialContext(ctx, "tcp", metadata.RemoteAddress())
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +79,9 @@ func NewDirectWithOption(option DirectOption) *Direct {
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
 		}),
-		loopBack: loopback.NewDetector(),
+		loopBack:        loopback.NewDetector(),
+		fragmentOption:  option.Fragment,
+		fragmentOptions: option.Fragments,
 	}
 }
 

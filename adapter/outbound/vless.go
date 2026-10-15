@@ -54,6 +54,25 @@ type Vless struct {
 	realityConfig   *tlsC.RealityConfig
 }
 
+type TLSCipherSuites []uint16
+
+func (s *TLSCipherSuites) UnmarshalText(text []byte) error {
+	*s = (*s)[:0]
+	known := make(map[string]uint16)
+	for _, suite := range append(tls.CipherSuites(), tls.InsecureCipherSuites()...) {
+		known[suite.Name] = suite.ID
+	}
+	for _, name := range strings.Split(string(text), ":") {
+		name = strings.TrimSpace(name)
+		id, ok := known[name]
+		if !ok {
+			return fmt.Errorf("unknown TLS cipher suite %q", name)
+		}
+		*s = append(*s, id)
+	}
+	return nil
+}
+
 type VlessOption struct {
 	BasicOption
 	Name              string            `proxy:"name"`
@@ -87,6 +106,7 @@ type VlessOption struct {
 	PrivateKey        string            `proxy:"private-key,omitempty"`
 	ServerName        string            `proxy:"servername,omitempty"`
 	ClientFingerprint string            `proxy:"client-fingerprint,omitempty"`
+	CipherSuites      TLSCipherSuites   `proxy:"cipher-suites,omitempty"`
 }
 
 type XHTTPOptions struct {
@@ -149,6 +169,7 @@ type XHTTPDownloadSettings struct {
 	PrivateKey        *string           `proxy:"private-key,omitempty"`
 	ServerName        *string           `proxy:"servername,omitempty"`
 	ClientFingerprint *string           `proxy:"client-fingerprint,omitempty"`
+	CipherSuites      *TLSCipherSuites  `proxy:"cipher-suites,omitempty"`
 }
 
 func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
@@ -190,6 +211,7 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 					Certificate:       v.option.Certificate,
 					PrivateKey:        v.option.PrivateKey,
 					ClientFingerprint: v.option.ClientFingerprint,
+					CipherSuites:      v.option.CipherSuites,
 					NextProtos:        []string{"http/1.1"},
 					ShadowTLS:         v.shadowTLSConfig,
 					Restls:            v.restlsConfig,
@@ -204,6 +226,7 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 					TLSConfig: &tls.Config{
 						ServerName:         serverName,
 						InsecureSkipVerify: v.option.SkipCertVerify,
+						CipherSuites:       v.option.CipherSuites,
 						NextProtos:         []string{"http/1.1"},
 					},
 					Fingerprint:    v.option.Fingerprint,
@@ -314,6 +337,7 @@ func (v *Vless) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 			Certificate:       v.option.Certificate,
 			PrivateKey:        v.option.PrivateKey,
 			ClientFingerprint: v.option.ClientFingerprint,
+			CipherSuites:      v.option.CipherSuites,
 			ECH:               v.echConfig,
 			ShadowTLS:         v.shadowTLSConfig,
 			Restls:            v.restlsConfig,
@@ -589,6 +613,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 				Certificate:       option.Certificate,
 				PrivateKey:        option.PrivateKey,
 				ClientFingerprint: option.ClientFingerprint,
+				CipherSuites:      option.CipherSuites,
 				NextProtos:        []string{"h2"},
 				ECH:               v.echConfig,
 				ShadowTLS:         v.shadowTLSConfig,
@@ -679,6 +704,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 						Certificate:       v.option.Certificate,
 						PrivateKey:        v.option.PrivateKey,
 						ClientFingerprint: v.option.ClientFingerprint,
+						CipherSuites:      v.option.CipherSuites,
 						ECH:               v.echConfig,
 						Reality:           v.realityConfig,
 						NextProtos:        []string{"h3"},
@@ -729,6 +755,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 			downloadPrivateKey := lo.FromPtrOr(ds.PrivateKey, v.option.PrivateKey)
 			downloadServerName := lo.FromPtrOr(ds.ServerName, v.option.ServerName)
 			downloadClientFingerprint := lo.FromPtrOr(ds.ClientFingerprint, v.option.ClientFingerprint)
+			downloadCipherSuites := lo.FromPtrOr(ds.CipherSuites, v.option.CipherSuites)
 			downloadEchConfig := v.echConfig
 			if ds.ECHOpts != nil {
 				downloadEchConfig, err = ds.ECHOpts.Parse()
@@ -836,6 +863,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 								Certificate:       downloadCertificate,
 								PrivateKey:        downloadPrivateKey,
 								ClientFingerprint: downloadClientFingerprint,
+								CipherSuites:      downloadCipherSuites,
 								ECH:               downloadEchConfig,
 								ShadowTLS:         downloadShadowTLSConfig,
 								Restls:            downloadRestlsConfig,
@@ -867,6 +895,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 							Certificate:       downloadCertificate,
 							PrivateKey:        downloadPrivateKey,
 							ClientFingerprint: downloadClientFingerprint,
+							CipherSuites:      downloadCipherSuites,
 							ECH:               downloadEchConfig,
 							Reality:           downloadRealityCfg,
 							NextProtos:        []string{"h3"},

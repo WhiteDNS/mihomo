@@ -24,6 +24,7 @@ type TLSConfig struct {
 	Certificate       string
 	PrivateKey        string
 	ClientFingerprint string
+	CipherSuites      []uint16
 	NextProtos        []string
 	ECH               *ech.Config
 	ShadowTLS         *shadowtls.Config
@@ -39,6 +40,7 @@ func (cfg *TLSConfig) ToStdConfig() (*tls.Config, error) {
 		TLSConfig: &tls.Config{
 			ServerName:         cfg.Host,
 			InsecureSkipVerify: cfg.SkipCertVerify,
+			CipherSuites:       cfg.CipherSuites,
 			NextProtos:         cfg.NextProtos,
 		},
 		Fingerprint:    cfg.FingerPrint,
