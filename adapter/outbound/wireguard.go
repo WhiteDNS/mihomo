@@ -427,7 +427,7 @@ func (o IPStackOption) validate() error {
 	default:
 		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
 	}
-	switch mipstack.CongestionControl(o.CongestionController) {
+	switch o.CongestionController {
 	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
 		return nil
 	default:
@@ -441,7 +441,10 @@ type ipStack interface {
 	Start() error
 	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
 	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
+	DialIP(ctx context.Context, network string, source, destination netip.Addr) (net.Conn, error)
+	ListenTCP(ctx context.Context, network string, local netip.AddrPort) (net.Listener, error)
 	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
+	ListenIP(ctx context.Context, network string, local netip.Addr) (net.PacketConn, error)
 	Read(buffers [][]byte, sizes []int, offset int) (int, error)
 	Write(buffers [][]byte, offset int) (int, error)
 	MTU() (int, error)
@@ -454,11 +457,7 @@ type ipStack interface {
 func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
 	mode := option.Mode
 	if mode == ipStackAuto {
-		if features.WithGVisor {
-			mode = ipStackGVisor
-		} else {
-			mode = ipStackMips
-		}
+		mode = ipStackMips
 	}
 	switch mode {
 	case ipStackGVisor:
@@ -468,13 +467,18 @@ func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32)
 			LocalAddresses: localAddresses,
 			MTU:            mtu,
 			TCP: mipstack.TCPSocketDefaults{
-				CongestionControl: mipstack.CongestionControl(option.CongestionController),
+				CongestionControl: option.CongestionController,
 				// Align with sing-wireguard: enable keepalive with 15-second
 				// idle/interval timing and gVisor's default probe count.
 				KeepAlive: true,
 				KeepAliveConfig: mipstack.KeepAliveConfig{
 					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
 				},
+			},
+			IP: mipstack.IPSocketDefaults{
+				// Align with sing-wireguard: fellow its IP socket semantics
+				IPHeaderIncludedOnRead:  true,
+				IPHeaderIncludedOnWrite: true,
 			},
 		})
 	default:
@@ -689,6 +693,9 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 	}
 	outbound.bind = wireguard.NewClientBind(context.Background(), wgSingErrorHandler{outbound.Name()}, clientDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
 
+	if outbound.bind == nil {
+		return nil, E.New("failed to create wireguard client bind")
+	}
 	outbound.localPrefixes, err = option.Prefixes()
 	if err != nil {
 		return nil, err

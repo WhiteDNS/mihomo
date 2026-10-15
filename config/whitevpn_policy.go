@@ -7,7 +7,7 @@ import (
 	"net"
 	"strconv"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Decode the final Android configuration once, before ParseRawConfig has side effects.
