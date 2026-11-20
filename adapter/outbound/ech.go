@@ -7,6 +7,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/ech"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/log"
 )
 
 type ECHOptions struct {
@@ -14,6 +15,10 @@ type ECHOptions struct {
 	Config string `proxy:"config,omitempty" obfs:"config,omitempty"`
 
 	QueryServerName string `proxy:"query-server-name,omitempty" obfs:"query-server-name,omitempty"`
+
+	// Optional dials without ECH when no config can be resolved, so ECH can be
+	// enabled by default for servers that may or may not publish an HTTPS record.
+	Optional bool `proxy:"optional,omitempty" obfs:"optional,omitempty"`
 }
 
 func (o ECHOptions) Parse() (*ech.Config, error) {
@@ -34,7 +39,12 @@ func (o ECHOptions) Parse() (*ech.Config, error) {
 			if o.QueryServerName != "" { // overrides the domain name used for ECH HTTPS record queries
 				serverName = o.QueryServerName
 			}
-			return resolver.ResolveECHWithResolver(ctx, serverName, resolver.ProxyServerHostResolver)
+			list, err := resolver.ResolveECHWithResolver(ctx, serverName, resolver.ProxyServerHostResolver)
+			if err != nil && o.Optional && ctx.Err() == nil {
+				log.Debugln("[ECH] %s: continuing without ECH: %v", serverName, err)
+				return nil, nil
+			}
+			return list, err
 		}
 	}
 	return echConfig, nil

@@ -20,8 +20,10 @@ func (cfg *Config) ClientHandle(ctx context.Context, tlsConfig *tls.Config) (err
 	if err != nil {
 		return fmt.Errorf("resolve ECH config error: %w", err)
 	}
-
 	tlsConfig.EncryptedClientHelloConfigList = echConfigList
+	if len(echConfigList) == 0 { // optional ECH without a config keeps the plain handshake
+		return nil
+	}
 	if tlsConfig.MinVersion != 0 && tlsConfig.MinVersion < tls.VersionTLS13 {
 		tlsConfig.MinVersion = tls.VersionTLS13
 	}
@@ -39,8 +41,10 @@ func (cfg *Config) ClientHandleUTLS(ctx context.Context, tlsConfig *tlsC.Config)
 	if err != nil {
 		return fmt.Errorf("resolve ECH config error: %w", err)
 	}
-
 	tlsConfig.EncryptedClientHelloConfigList = echConfigList
+	if len(echConfigList) == 0 { // optional ECH without a config keeps the plain handshake
+		return nil
+	}
 	if tlsConfig.MinVersion != 0 && tlsConfig.MinVersion < tlsC.VersionTLS13 {
 		tlsConfig.MinVersion = tlsC.VersionTLS13
 	}
