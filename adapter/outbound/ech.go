@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/metacubex/mihomo/component/ech"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -39,13 +41,39 @@ func (o ECHOptions) Parse() (*ech.Config, error) {
 			if o.QueryServerName != "" { // overrides the domain name used for ECH HTTPS record queries
 				serverName = o.QueryServerName
 			}
-			list, err := resolver.ResolveECHWithResolver(ctx, serverName, resolver.ProxyServerHostResolver)
-			if err != nil && o.Optional && ctx.Err() == nil {
-				log.Debugln("[ECH] %s: continuing without ECH: %v", serverName, err)
-				return nil, nil
+			if o.Optional {
+				return resolveOptionalECH(ctx, serverName)
 			}
-			return list, err
+			return resolver.ResolveECHWithResolver(ctx, serverName, resolver.ProxyServerHostResolver)
 		}
 	}
 	return echConfig, nil
+}
+
+const (
+	// Optional ECH must not stall every dial where HTTPS DNS records are dropped.
+	optionalECHLookupTimeout = 2 * time.Second
+	optionalECHRetryAfter    = time.Minute
+)
+
+// optionalECHMisses maps a server name to the time its next ECH lookup is allowed.
+var optionalECHMisses sync.Map
+
+func resolveOptionalECH(ctx context.Context, serverName string) ([]byte, error) {
+	if retryAt, ok := optionalECHMisses.Load(serverName); ok && time.Now().Before(retryAt.(time.Time)) {
+		return nil, nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, optionalECHLookupTimeout)
+	defer cancel()
+	list, err := resolver.ResolveECHWithResolver(lookupCtx, serverName, resolver.ProxyServerHostResolver)
+	if err == nil && len(list) > 0 {
+		optionalECHMisses.Delete(serverName)
+		return list, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	optionalECHMisses.Store(serverName, time.Now().Add(optionalECHRetryAfter))
+	log.Debugln("[ECH] %s: continuing without ECH: %v", serverName, err)
+	return nil, nil
 }
