@@ -51,6 +51,28 @@ const (
 type wireguardGoDevice interface {
 	Close()
 	IpcSet(uapiConf string) error
+	BindUpdate() error
+}
+
+// wireGuardOutbounds holds every open WireGuard outbound so their sockets can be reopened together.
+var wireGuardOutbounds sync.Map
+
+// RebindWireGuardOutbounds reopens the UDP socket of every running WireGuard outbound.
+// Android protects sockets from its own VPN only through a hook installed when the TUN starts;
+// a socket opened earlier (for example by a health check) keeps routing into the tunnel and loops.
+func RebindWireGuardOutbounds() {
+	wireGuardOutbounds.Range(func(key, _ any) bool {
+		w := key.(*WireGuard)
+		w.deviceMutex.Lock()
+		wgDevice := w.device
+		w.deviceMutex.Unlock()
+		if wgDevice != nil {
+			if err := wgDevice.BindUpdate(); err != nil {
+				log.Warnln("[WG](%s) rebind failed: %v", w.Name(), err)
+			}
+		}
+		return true
+	})
 }
 
 const (
@@ -814,6 +836,7 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		})
 	}
 
+	wireGuardOutbounds.Store(outbound, struct{}{})
 	return outbound, nil
 }
 
@@ -1126,6 +1149,7 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 
 // Close implements C.ProxyAdapter
 func (w *WireGuard) Close() error {
+	wireGuardOutbounds.Delete(w)
 	w.runCancel()
 	w.deviceMutex.Lock()
 	wgDevice := w.device
